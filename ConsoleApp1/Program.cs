@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Linq;
 using TwitchLib.Client;
 using TwitchLib.Client.Events;
@@ -36,6 +37,17 @@ namespace ConsoleApp1
         private static CancellationTokenSource? _cts;
 
         private static bool _chatPaused = false;
+
+        // ======================================
+        // COLA DE ENVÍO A STEAM (anti-flood)
+        // ======================================
+        private static readonly ConcurrentQueue<string> _steamMessageQueue = new();
+        private static int _consecutiveSent = 0;
+        private const int BurstThreshold = 15;                                   // mensajes libres antes de frenar
+        private static readonly TimeSpan _steamSendInterval = TimeSpan.FromMilliseconds(800); // delay una vez superado el umbral
+        private static readonly TimeSpan _idleResetThreshold = TimeSpan.FromSeconds(3);       // inactividad para resetear la ráfaga
+        private static DateTime _lastSendTime = DateTime.MinValue;
+
         private static void UpdateConsoleTitle()
         {
             string status = _chatPaused ? "CHAT PAUSADO" : "CHAT ACTIVO";
@@ -93,7 +105,7 @@ namespace ConsoleApp1
             _steamCallbackManager.Subscribe<SteamUser.LoggedOnCallback>(OnSteamLoggedOn);
             _steamCallbackManager.Subscribe<SteamClient.DisconnectedCallback>(OnSteamDisconnected);
             _steamCallbackManager.Subscribe<SteamUser.LoggedOffCallback>(OnSteamLoggedOff);
-            _steamCallbackManager.Subscribe<SteamFriends.ChatMsgCallback>(OnSteamChatMessage);
+            _steamCallbackManager.Subscribe<SteamFriends.FriendMsgCallback>(OnSteamFriendMessage);
             Console.WriteLine("Callback OnSteamChatMessage suscrito correctamente.");
 
 
@@ -101,6 +113,7 @@ namespace ConsoleApp1
 
             _cts = new CancellationTokenSource();
             Task.Run(() => SteamLoop(_cts.Token));
+            Task.Run(() => SteamSendQueueLoop(_cts.Token));
             Task.Run(() => ConsoleCommandLoop());
 
             while (true)
@@ -241,26 +254,65 @@ namespace ConsoleApp1
 
             if (!_chatPaused && !string.IsNullOrEmpty(msg))
             {
-                // Iniciar el cronómetro
-                var stopwatch = Stopwatch.StartNew();
-
-                try
-                {
-                    SendSteamMessage($"{e.ChatMessage.DisplayName}: {msg}");
-                }
-                finally
-                {
-                    // Detener el cronómetro y mostrar el tiempo
-                    stopwatch.Stop();
-                    Console.WriteLine(
-                        $"[Tiempo] Mensaje procesado en {stopwatch.ElapsedMilliseconds} ms " +
-                        $"({stopwatch.Elapsed.TotalSeconds:F3} segundos)"
-                    );
-                }
+                // Ya no se manda directo: se encola y el worker (SteamSendQueueLoop)
+                // se encarga de espaciar los envíos si hay ráfaga.
+                _steamMessageQueue.Enqueue($"{e.ChatMessage.DisplayName}: {msg}");
             }
         }
 
+        // ======================================
+        // WORKER: ENVÍA LA COLA A STEAM CON ANTI-FLOOD
+        // ======================================
+        private static async Task SteamSendQueueLoop(CancellationToken token)
+        {
+            Console.WriteLine("SteamSendQueueLoop iniciado.");
 
+            while (!token.IsCancellationRequested)
+            {
+                if (_steamMessageQueue.TryDequeue(out var message))
+                {
+                    // Si hubo inactividad, se resetea el contador de ráfaga
+                    if (DateTime.UtcNow - _lastSendTime > _idleResetThreshold)
+                    {
+                        _consecutiveSent = 0;
+                    }
+
+                    // A partir del mensaje N° (BurstThreshold + 1) en la ráfaga, se aplica delay
+                    if (_consecutiveSent >= BurstThreshold)
+                    {
+                        try
+                        {
+                            await Task.Delay(_steamSendInterval, token).ConfigureAwait(false);
+                        }
+                        catch (TaskCanceledException)
+                        {
+                            break;
+                        }
+                    }
+
+                    var stopwatch = Stopwatch.StartNew();
+                    SendSteamMessage(message);
+                    _lastSendTime = DateTime.UtcNow;
+                    _consecutiveSent++;
+                    stopwatch.Stop();
+
+                    Console.WriteLine(
+                        $"[Cola] Enviado ({_consecutiveSent} en ráfaga) en {stopwatch.ElapsedMilliseconds} ms"
+                    );
+                }
+                else
+                {
+                    try
+                    {
+                        await Task.Delay(100, token).ConfigureAwait(false);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
 
         // ======================================
         // ENVIAR A STEAM
@@ -429,22 +481,22 @@ namespace ConsoleApp1
             }
         }
 
-        private static void OnSteamChatMessage(SteamFriends.ChatMsgCallback callback)
+        private static void OnSteamFriendMessage(SteamFriends.FriendMsgCallback callback)
         {
-            ulong senderId = callback.ChatterID.ConvertToUInt64();
+            if (callback.EntryType != EChatEntryType.ChatMsg)
+                return; // ignora typing notifications, etc.
+
+            ulong senderId = callback.Sender.ConvertToUInt64();
             string message = callback.Message ?? "";
 
             Console.WriteLine("=================================");
             Console.WriteLine("[Steam] Mensaje recibido:");
             Console.WriteLine($"Remitente: {senderId}");
             Console.WriteLine($"Mensaje:   {message}");
-            Console.WriteLine($"Tipo:      {callback.ChatMsgType}");
             Console.WriteLine("=================================");
 
-            // Solo procesar comandos (mensajes que empiezan con "!")
-            if (callback.ChatMsgType == EChatEntryType.ChatMsg && message.StartsWith("!"))
+            if (message.StartsWith("!"))
             {
-                // Verificar si el remitente tiene permisos (es el target o está en la lista)
                 bool allowed = senderId == _targetSteamId || _steamTargets.ContainsValue(senderId);
 
                 if (!allowed)
@@ -453,10 +505,8 @@ namespace ConsoleApp1
                     return;
                 }
 
-                // Procesar el comando
-                ProcessSteamCommand(callback.ChatterID, message);
+                ProcessSteamCommand(callback.Sender, message);
             }
-            // Ignorar mensajes que no son comandos
         }
 
 
@@ -698,7 +748,7 @@ namespace ConsoleApp1
             else
             {
                 Console.WriteLine("Opción inválida.");
-            } 
+            }
         }
     }
 }
